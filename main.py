@@ -1,6 +1,7 @@
 import socket
 import getpass
 import select
+import threading
 import shelve
 import random
 import sys
@@ -10,6 +11,8 @@ import datetime
 import hack
 import string
 import codecs
+from multiprocessing.pool import ThreadPool
+from multiprocessing import TimeoutError
 def int2base(x, base):
 	digs = string.digits + string.ascii_lowercase
 	if x < 0:
@@ -42,15 +45,19 @@ def send(sock,data,verbose=True):
 
 class Commands(object):
 	def __init__(self,bot):
+		self.pool=ThreadPool(processes=1)
+		self.threads=dict()
 		self.commands=[cmd for cmd in dir(self) if cmd.startswith("cmd_")]
 		self.bot=bot
 		self.admins=[self.bot.owner]
-		modules=set(["math","cmath","sympy","numpy","scipy","datetime","time"])
-		self.calc_mods={}
+		modules=set(["math","cmath","sympy","numpy","scipy","datetime","time","random"])
+		self.safe_builtins=set([len,range,dir,chr,ord])
+		self.calc_mods={"__builtins__":{func.__name__:func for func in self.safe_builtins}}
 		for mod in modules:
 			try:
 				self.calc_mods[mod]=__import__(mod)
-			except ImportError:
+			except ImportError as e:
+				print("Unable to load module {}:{}".format(mod,e))
 				if mod in self.modules:
 					modules.remove(mod)
 		self.modules=modules
@@ -68,6 +75,7 @@ class Commands(object):
 	def terminate(self,msg=None):
 		self.bot.terminate(msg)
 	""" # Does not work D:
+	
 	def cmd_trigger(self,trigger):
 		if len(trigger)>1:
 			return "Trigger must be a single character"
@@ -89,12 +97,39 @@ class Commands(object):
 			b_to=int(b_to)
 		result=int2base(int(n,b_from),b_to)
 		return "{} (Base {}) = {} (Base {})".format(n,b_from,result,b_to)
-	
+	def cmd_stopcalc(self):
+		self.pool.terminate()
+		self.pool=ThreadPool(processes=1)
+		self.threads=dict()
+		return "All Computations terminated"
 	def cmd_calc(self,*expr):
-		t_s=time.time()
-		ret=eval(" ".join(expr),{"__builtins__":{}},self.calc_mods)
-		d_t=datetime.timedelta(seconds=time.time()-t_s)
-		return "{} <{}>".format(ret,d_t)
+		expr=" ".join(expr)
+		for badword in ["__builtins__","__import__","__call__","__class__","__getattribute__","__getattr__","__dict__"]:
+			if expr.find(badword)!=-1:
+				return "foudn blacklisted expression: {}".format(badword)
+		def runme():
+			t_s=time.time()
+			ret=eval(expr,self.calc_mods,self.calc_mods)
+			d_t=datetime.timedelta(seconds=time.time()-t_s)
+			return "{} <{}>".format(ret,d_t)
+		self.threads[(time.time(),expr)]=self.pool.apply_async(runme,())
+		new_threas=dict()
+		for (started,expr),thread in self.threads.items():
+			if thread:
+				new_threas[(started,expr)]=thread
+		self.threads=new_threas
+		for (started,expr),thread in self.threads.items():
+			if (time.time()-started)>60:
+				self.threads[(started,expr)]=None
+				return "{} Timed out".format(expr)
+			try:
+				result=thread.get(1)
+			except TimeoutError:
+				result=None
+			if result:
+				self.threads[(started,expr)]=None
+				return "{} => {}".format(expr,result)
+		return
 	
 	def cmd_lsmod(self):
 		return "Available modules: "+",".join(self.modules)
@@ -154,8 +189,8 @@ class IRCBot(object):
 		self.trigger="$"
 		self.server="irc.freenode.net"
 		self.port=6667
-		self.channels=["#tuug"]
-		#self.channels=['#earthnuker_bot_test']
+		#self.channels=["#tuug"]
+		self.channels=['#earthnuker_bot_test']
 		self.nick="EN_bot_test"
 		self.owner="Earthnuker"
 		self.password=getpass.getpass("Password:")
@@ -187,7 +222,7 @@ class IRCBot(object):
 		else:
 			send(self.irc_socket,"QUIT Terminating")
 		self.irc_socket.close()
-		self.db.close()
+		#self.db.close()
 		exit(0)
 		
 	def process(self,message):
